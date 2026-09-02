@@ -1,4 +1,4 @@
-"""Thermoviscoelastic classical laminate theory model.
+"""Thermoviscoelastic classical laminate theory model. 
 
 This script evaluates cooling-induced residual stress, curvature, and
 out-of-plane displacement for the GF/PP laminate.
