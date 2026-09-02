@@ -1,0 +1,534 @@
+"""Thermoviscoelastic classical laminate theory model.
+
+This script evaluates cooling-induced residual stress, curvature, and
+out-of-plane displacement for the GF/PP laminate.
+
+"""
+
+import numpy as np
+from numpy.linalg import inv
+import matplotlib.pyplot as plt
+import math
+import pandas as pd
+
+
+# =============================================================================
+# Material parameters
+# =============================================================================
+
+# Viscoelasticity
+NG = 18
+W = np.array([0.203, 0.062, 0.079, 0.11, 0.119, 0.088, 0.102, 0.063,
+              0.024, 0.018, 0.025, 0.024, 0.021, 0.008, 0.007, 0.002, 0.001, 0.011])
+t0 = np.array([2.61E-4, 1.67E-3, 1.01E-2, 5.51E-1, 5.48E+0, 6.09E+1,
+                  5.79E+2, 5.50E+3, 7.15E+4, 1.11E+5, 1.00E+7, 1.81E+11,
+                  5.93E+14, 1.94E+18, 6.33E+20, 1.02E+21, 1.50E+22, 1.20E+23]) * 60
+
+def shift_factor(Ti):
+    """Return the temperature shift factor for the resin response."""
+    if Ti <= 114.07:
+        aT = 10 ** (-(11.92*(Ti-30))/(99.72+(Ti-30)))
+    else:
+        aT =  10 ** (-5.91e-3*(Ti-211.1)**2 - 5.54)
+    return aT
+
+# Resin relaxation modulus
+def viscoelastic_Em(Ti, dt):
+    """Calculate the effective resin modulus for a time increment."""
+    aT = shift_factor(Ti)
+    ksi = dt/aT if dt>0 else 0
+    Em = 11.43  # Long-term relaxation modulus of the resin
+    Ep = 1269.17-11.43
+    term = 0
+    for g in range(NG):
+        tm = t0[g]
+        term += Ep*W[g]*aT*tm/dt * (1 - np.exp(-ksi/tm))
+    Em += term
+    return Em
+
+
+# Coefficient of thermal expansion (CTE)
+def alpha_func(Ti, dt, TEMP_RATE):
+    """Calculate the effective composite CTE at the current state."""
+
+    # Crystallization behavior
+    T0 = 135.6285 * TEMP_RATE ** (-0.0353)
+    T_Half = 6.0351 * TEMP_RATE ** (-0.7565)
+
+    # Crystallization-induced shrinkage
+    delta_T = T0 - Ti
+    delta_T2 = T0 - Ti - (dt*TEMP_RATE/60)
+    if Ti > T0:
+        X=0
+    else:
+        X = 1.0 - math.exp(-(math.log(2.0) / (T_Half ** 3)) * ((delta_T / TEMP_RATE) ** 3))
+    if delta_T2 < 0:
+        X2 = 0
+    else:
+        X2 = 1.0 - math.exp(-(math.log(2.0) / (T_Half ** 3)) * ((delta_T2 / TEMP_RATE) ** 3))
+    V_c = 0.5 * X
+    V_c2 = 0.5 * X2
+    denc = 946
+    dena = 855
+    dent1 = denc * V_c + (1 - V_c) * dena
+    dent2 = denc * V_c2 + (1 - V_c2) * dena
+    Vcry = (dent1 - dent2) / dent2
+    e_cry = (-1.0 + math.sqrt(1.0 + (4.0 / 3.0) * Vcry)) / 2.0
+    if delta_T2 < 0:
+        alpha_cry = 0.0
+    else:
+        alpha_cry = e_cry/(dt*TEMP_RATE/60)
+
+    # Resin CTE
+    alpha_ma = 2.3e-4
+    alpha_mc = 0.8e-4
+    alpha_m = ((alpha_ma * (1 - V_c) + alpha_mc * V_c) * (1 - V_c) + alpha_mc * V_c) + alpha_cry
+
+    # Fiber CTE
+    alpha_f1 = 5.4e-6
+    alpha_f2 = 5.4e-6
+    E_f1 = 74000
+    vu_f12 = 0.2
+    vu_m = 0.415
+    V_f = 0.3
+    V_m = 1 - V_f
+
+    # Composite CTE
+    E_m = viscoelastic_Em(Ti, dt)
+    alpha1 = 1.2*( (V_f * alpha_f1 * E_f1 + V_m * alpha_m * E_m) / (V_f * E_f1 + V_m * E_m))
+    alpha2 = 1.2*(V_f * (alpha_f2 + vu_f12 * alpha_f1) + V_m * (1.0 + vu_m) * alpha_m - (
+                vu_f12 * V_f + vu_m * V_m) * alpha1)
+    alpha3 = 0
+    return np.array([alpha1, alpha2, alpha3])
+
+# Composite stiffness matrices from the reduced-order model (ROM)
+def stiffness_matrix_glassy():
+    """Return the glassy-state in-plane stiffness matrix."""
+    return np.array([
+        [23.408e9, 0.882e9, 0],
+        [0.882e9, 2.572e9, 0],
+        [0, 0, 0.817e9]])
+Cg = stiffness_matrix_glassy()
+
+def stiffness_matrix_rubber():
+    """Return the rubbery-state in-plane stiffness matrix."""
+    return np.array([
+        [22.210e9, 0.008e9, 0],
+        [0.008e9, 0.0222e9, 0],
+        [0, 0, 0.0075e9]])
+Cr = stiffness_matrix_rubber()
+
+Cp = Cg - Cr # Relax stiffness matrix
+
+def viscoelastic_Cij(Ti, dt):
+    """Calculate the effective viscoelastic stiffness matrix."""
+    aT = shift_factor(Ti)
+    ksi = dt/aT if dt>0 else 0
+
+    C_eff = np.copy(Cr)
+    for i in range(3):
+        for j in range(3):
+            term = 0
+            for g in range(NG):
+                tm = t0[g]
+                term += Cp[i,j]*W[g]*aT*tm/dt * (1 - np.exp(-ksi/tm))
+            C_eff[i,j] += term
+    return C_eff
+
+# Laminate theory  ABD matrix
+def ABD_r(theta, Ti, dt, z):
+    """Return the inverse ABD matrix for the current laminate state."""
+    C_r = rotate_C(theta, Ti, dt)
+    A = np.zeros((3, 3))
+    B = np.zeros((3, 3))
+    D = np.zeros((3, 3))
+    for i in range(len(C_r)):
+        A = A + C_r[i] * (z[i+1] - z[i])
+        B = B + C_r[i] * (z[i+1]**2 - z[i]**2)/2
+        D = D + C_r[i] * (z[i+1]**3 - z[i]**3)/3
+    ABD = np.block([[A, B], [B, D]])
+    abd_r = np.linalg.inv(ABD)
+    return abd_r
+
+# =============================================================================
+# Laminate transformation utilities
+# =============================================================================
+
+def transformation_matrix(theta):
+    """Return the in-plane transformation matrix for an angle in radians."""
+    n = np.sin(theta)
+    m = np.cos(theta)
+    T = np.array([[m**2, n**2,     2*n*m],
+                  [n**2, m**2,    -2*n*m],
+                  [-m*n,  m*n, m**2-n**2]])
+    return T
+
+def Reuter():
+    """Return the Reuter matrix used for engineering shear notation."""
+    R = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 2]])
+    return R
+
+def rotate_C(theta, Ti, dt):
+    """Rotate the effective stiffness matrix for one or more ply angles."""
+    R = Reuter()
+    C = viscoelastic_Cij(Ti,dt)
+    if isinstance(theta, float):
+        T = transformation_matrix(theta)
+        C_r = inv(T)@C@R@T@inv(R)
+    elif isinstance(theta, list):
+        C_r = [None]*len(theta)
+        for i, phi in enumerate(theta):
+            T = transformation_matrix(phi)
+            C_r[i] = inv(T)@C@R@T@inv(R)
+    return C_r
+
+def rotate_Cp(theta):
+    """Rotate the relaxation stiffness matrix for one or more ply angles."""
+    R = Reuter()
+    C = np.copy(Cp)
+    if isinstance(theta, float):
+        T = transformation_matrix(theta)
+        C_p = inv(T)@C@R@T@inv(R)
+    elif isinstance(theta, list):
+        C_p = [None]*len(theta)
+        for i, phi in enumerate(theta):
+            T = transformation_matrix(phi)
+            C_p[i] = inv(T)@C@R@T@inv(R)
+    else:
+        raise TypeError("Please input a float or a list of floats.")
+    return C_p
+
+def rotate_stress_to_matCS(stress_r, theta):
+    """Transform laminate-coordinate stress to ply material coordinates."""
+    stress = np.zeros(stress_r.shape)
+    if isinstance(theta, float):
+        T = transformation_matrix(theta)
+        stress = T@stress_r
+    elif isinstance(theta, list):
+        for i, phi in enumerate(theta):
+            T = transformation_matrix(phi)
+            stress[:, i*2] = T@stress_r[:, i*2]
+            stress[:, i*2+1] = T@stress_r[:, i*2+1]
+    return stress
+
+def ply_edges(h, N):
+    """Return the through-thickness coordinates of an N-ply laminate."""
+    z = np.linspace(-N*h/2, N*h/2, N+1)
+    return z
+
+def rotate_alpha(theta, Ti, dt, TEMP_RATE):
+    """Rotate the composite CTE vector into the laminate coordinates."""
+    R = Reuter()
+    alpha = alpha_func(Ti,dt,TEMP_RATE)
+    alpha_r = [None] * len(theta)
+    for i, phi in enumerate(theta):
+            T = transformation_matrix(phi)
+            alpha_r[i] = R@inv(T)@inv(R)@alpha
+    return alpha_r
+
+# =============================================================================
+# Thermal-viscoelastic laminate response
+# =============================================================================
+
+def ply_stress(theta, T_initial, T_final, n, z, TEMP_RATE):
+    """Integrate cooling-induced stress and deformation through the laminate."""
+    # Generate the temperature history, including both endpoints.
+    T_vals = np.linspace(T_initial, T_final, n)
+    d_total = np.zeros(6)   # Accumulated deformation: (eps0_x, eps0_y, gamma0_xy, kappa_x, kappa_y, kappa_xy)
+    z_int = np.repeat(z, 2)[1:-1] # z-coordinates of the top and bottom surfaces of each ply.
+    stress_r = np.zeros((3, len(z_int)))
+    beta = -TEMP_RATE / 60 # Cooling rate in temperature units per second.
+    dt = (T_initial-T_final)/abs(beta)/ (n - 1)
+    nply = len(theta)
+    S_jprev = np.zeros((NG,nply, 3))
+    S_iprev_top = np.zeros((NG,nply, 3))
+    S_iprev_bot = np.zeros((NG,nply, 3))
+
+    # Integrate over each temperature increment using the left-end temperature.
+    for k in range(1, n):
+        S_jnew = np.zeros((NG,nply, 3))
+        S_inew_top = np.zeros((NG,nply, 3))
+        S_inew_bot = np.zeros((NG,nply, 3))
+        expff_top = np.zeros((nply, 3))
+        expff_bot = np.zeros((nply, 3))
+        expff = np.zeros((nply, 3))
+        d_stress_r = np.zeros((3, len(z_int)))
+        T_prev = T_vals[k]
+        # Update the hereditary stress variables S_j.
+        aT = shift_factor(T_prev)
+        ksi = dt / aT if dt > 0 else 0
+        C_p = rotate_Cp(theta)
+        C_r = rotate_C(theta, T_prev,dt)
+        alpha_curr = rotate_alpha(theta, T_prev,dt,TEMP_RATE)
+        for iply in range(nply):
+            Cp_i = C_p[iply]  # (3×3)
+            alpha_i = alpha_curr[iply]  # (3,)
+            d_eps_th = beta * alpha_i
+            for m in range(NG):
+                expf = np.exp(-ksi / t0[m])
+                S_jnew[m, iply, :]= (expf * S_jprev[m, iply, :]
+                                +(1.0 - expf) * W[m]*t0[m]* aT* (Cp_i @ d_eps_th))
+                expff[iply] += (np.exp((-ksi / t0[m]) )- 1) * S_jnew[m, iply, :]
+                S_jprev[m, iply, :] = S_jnew[m, iply, :]
+        dN = np.zeros(3)
+        dM = np.zeros(3)
+        dN2 = np.zeros(3)
+        dM2 = np.zeros(3)
+
+        # Assemble incremental membrane forces and bending moments.
+        for iply in range(len(C_r)):
+            dz = z[iply + 1] - z[iply]
+            dz2 = 0.5 * (z[iply + 1] ** 2 - z[iply] ** 2)
+
+            # Instantaneous elastic thermal contribution.
+            dN += (C_r[iply] @ alpha_curr[iply]*beta * dt+expff[iply] )* dz
+            dM += (C_r[iply] @ (beta * alpha_curr[iply] * dt)+expff[iply]) * dz2
+            dN2 += (C_r[iply] @ alpha_curr[iply]*beta* dt  )* dz
+            dM2 += (C_r[iply] @ (beta * alpha_curr[iply] * dt)) * dz2
+
+        # Compute the incremental laminate deformation.
+        abd_r=ABD_r(theta, T_prev, dt, z)
+        NM = np.hstack((dN, dM))
+        NM2 = np.hstack((dN2, dM2))
+        d_increment = abd_r @ NM
+        d_increment2 = abd_r @ NM2
+        d_eps02 = d_increment2[:3]
+        d_kappa2=d_increment2[3:]
+
+        for iply in range(nply):
+            eps_top2 = d_eps02 + d_kappa2 * z_int[iply * 2] - beta * alpha_curr[iply] * dt
+            eps_bot2 = d_eps02 + d_kappa2 * z_int[iply * 2 + 1] - beta * alpha_curr[iply] * dt
+
+            Cp_i = C_p[iply]
+            for m in range(NG):
+                expf = np.exp(-ksi / t0[m])
+                S_inew_top[m, iply, :] = ((expf * S_iprev_top[m, iply, :])
+                                    + (1.0 - expf) * W[m] * (Cp_i @ eps_top2) * t0[m] * aT / dt)
+                expff_top[iply] += (np.exp((-ksi / t0[m])) - 1) * S_inew_top[m, iply, :]
+                S_iprev_top[m, iply, :] = S_inew_top[m, iply, :]
+            for m in range(NG):
+                expf = np.exp(-ksi / t0[m])
+                S_inew_bot[m, iply, :] = ((expf * S_iprev_bot[m, iply, :])
+                                    + (1.0 - expf) * W[m] * (Cp_i @ eps_bot2) * t0[m] * aT / dt)
+                expff_bot[iply] += (np.exp((-ksi / t0[m])) - 1) * S_inew_bot[m, iply, :]
+                S_iprev_bot[m, iply, :] = S_inew_bot[m, iply, :]
+
+        for i in range(len(C_r)):
+            # Incremental residual strain at the top and bottom surfaces.
+            eps_top2 = d_eps02 + d_kappa2 * z_int[i * 2] - beta * alpha_curr[i] * dt
+            eps_bot2 = d_eps02 + d_kappa2 * z_int[i * 2 + 1] - beta * alpha_curr[i] * dt
+            A = C_r[i] @ eps_top2
+            B = expff_top[i]
+            C = C_r[i] @ eps_bot2
+            D = expff_bot[i]
+            d_stress_r[:, i * 2] = A - np.sign(A*B) * B
+            d_stress_r[:, i * 2+1] = C - np.sign(C*D) * D
+
+        d_total += d_increment
+        stress_r += d_stress_r
+
+    return stress_r,d_total,alpha_curr,S_jprev,S_inew_bot,S_inew_top
+
+def stress_relax(theta, T_initial, T_final, n, z, TEMP_RATE):
+    """Integrate post-cooling stress relaxation at a fixed temperature."""
+
+    stress_r, d_total, alpha_curr,S_jprev,S_iprev_bot,S_iprev_top=ply_stress(theta, T_initial, T_final, n, z,TEMP_RATE)
+    C_p = rotate_Cp(theta)
+    z_int = np.repeat(z, 2)[1:-1]  # z-coordinates of ply surfaces.
+    dt = (30*24*60*60) / (n - 1)
+    nply = len(theta)
+
+    # Integrate over each temperature increment using the left-end temperature.
+    for k in range(1, n):
+
+        S_jnew = np.zeros((NG,nply, 3))
+        S_inew_top = np.zeros((NG,nply, 3))
+        S_inew_bot = np.zeros((NG,nply, 3))
+        expff_top = np.zeros((nply, 3))
+        expff_bot = np.zeros((nply, 3))
+        expff = np.zeros((nply, 3))
+        d_stress_r = np.zeros((3, len(z_int)))
+        T_prev = 30
+        aT = 1
+
+        # Update the hereditary stress variables.
+        ksi = dt
+        C_r = rotate_C(theta, T_prev, dt)
+        for iply in range(nply):
+            for m in range(NG):
+                expf = np.exp(-ksi / t0[m])
+                S_jnew[m, iply, :] = (expf * S_jprev[m, iply, :] )
+                expff[iply] -= (1-expf) * S_jnew[m, iply, :]
+                S_jprev[m, iply, :]= S_jnew[m, iply, :]
+        dN = np.zeros(3)
+        dM = np.zeros(3)
+        dN2 = np.zeros(3)
+        dM2 = np.zeros(3)
+        # Assemble incremental membrane forces and bending moments.
+
+        for iply in range(len(C_r)):
+            dz = z[iply + 1] - z[iply]
+            dz2 = 0.5 * (z[iply + 1] ** 2 - z[iply] ** 2)
+            # Instantaneous elastic thermal contribution.
+            dN += ( expff[iply]) * dz
+            dM += ( expff[iply]) * dz2
+            dN2 += ( expff[iply]) * dz
+            dM2 += ( expff[iply]) * dz2
+        # Compute the incremental laminate deformation.
+        abd_r = ABD_r(theta, T_prev, dt, z)
+        NM = np.hstack((dN, dM))
+        NM2 = np.hstack((dN, dM))
+        d_increment = abd_r @ NM
+        d_increment2 = abd_r @ NM2
+        d_eps02 = d_increment2[:3]
+        d_kappa2 = d_increment2[3:]
+
+        for iply in range(nply):
+            eps_top = d_eps02 + d_kappa2 * z_int[iply * 2]
+            eps_bot = d_eps02 + d_kappa2 * z_int[iply * 2 + 1]
+            Cp_i = C_p[iply]
+            for m in range(NG):
+                expf = np.exp(-ksi / t0[m])
+                S_inew_top[m, iply, :]= ((expf * S_iprev_top[m, iply, :])
+                                    + (1.0 - expf) * W[m] * (Cp_i @ eps_top) * t0[m] * aT / dt)
+                expff_top[iply] += (np.exp((-ksi / t0[m])) - 1) * S_inew_top[m, iply, :]
+                S_iprev_top[m, iply, :] = S_inew_top[m, iply, :]
+            for m in range(NG):
+                expf = np.exp(-ksi / t0[m])
+                S_inew_bot[m, iply, :]= ((expf * S_iprev_bot[m, iply, :])
+                                    + (1.0 - expf) * W[m] * (Cp_i @ eps_bot) * t0[m] * aT / dt)
+                expff_bot[iply] += (np.exp((-ksi / t0[m])) - 1) * S_inew_bot[m, iply, :]
+                S_iprev_bot[m, iply, :]= S_inew_bot[m, iply, :]
+
+        for i in range(len(C_r)):
+            # Incremental residual strain at the top and bottom surfaces.
+            eps_top = d_eps02 + d_kappa2 * z_int[i * 2]
+            eps_bot = d_eps02 + d_kappa2 * z_int[i * 2 + 1]
+            A = C_r[i] @ eps_top
+            B = expff_top[i]
+            C = C_r[i] @ eps_bot
+            D = expff_bot[i]
+            d_stress_r[:, i * 2] = A - np.sign(A*B) * B
+            d_stress_r[:, i * 2+1] = C - np.sign(C*D) * D
+
+        d_total += d_increment
+        stress_r += d_stress_r
+
+    return  stress_r,d_total,eps_top
+
+def main():
+    """Run the reference laminate calculation and export displacement fields."""
+    # -------------------------------------------------------------------------
+    # Laminate definition
+    # -------------------------------------------------------------------------
+    ply_thickness = 0.25e-3
+    num_plies = 8
+    layup = [0, 1.571, 0, 1.571, 0, 1.571, 0, 1.571]
+    z = ply_edges(ply_thickness, num_plies)
+
+    # -------------------------------------------------------------------------
+    # Thermal loading
+    # -------------------------------------------------------------------------
+    temperature_rate = 5
+    temperature_initial = 135.6285 * temperature_rate ** (-0.0353)
+    temperature_final = 25
+    num_temperature_points = 150
+
+    # Integrate the thermal history.
+    stress_global, deformation, _, s_j, s_i_bot, s_i_top = ply_stress(
+        layup,
+        temperature_initial,
+        temperature_final,
+        num_temperature_points,
+        z,
+        temperature_rate,
+    )
+    stress_relaxed, deformation_relaxed, _ = stress_relax(
+        layup,
+        temperature_initial,
+        temperature_final,
+        num_temperature_points,
+        z,
+        temperature_rate,
+    )
+
+    # Transform stresses to ply material coordinates (Abaqus convention).
+    stress_ply = rotate_stress_to_matCS(stress_global, layup)
+    stress_ply_relaxed = rotate_stress_to_matCS(stress_relaxed, layup)
+
+    print(stress_global)  # Global laminate coordinates
+    print(stress_ply)     # Ply material coordinates
+    print(stress_relaxed)   # Global laminate coordinates_relaxed
+    print(stress_ply_relaxed)   # Ply material coordinates_relaxed
+
+    # -------------------------------------------------------------------------
+    # Curvature and out-of-plane displacement
+    # -------------------------------------------------------------------------
+    kappa_x = deformation[3]
+    kappa_y = deformation[4]
+    kappa_xy = deformation[5]
+    length_x = 0.25  # Plate length, m
+    length_y = 0.25  # Plate width, m
+    num_x = 50
+    num_y = 50
+    x = np.linspace(-length_x / 2, length_x / 2, num_x)
+    y = np.linspace(-length_y / 2, length_y / 2, num_y)
+    w_field = np.zeros((num_x, num_y))
+
+    for i, x_i in enumerate(x):
+        for j, y_j in enumerate(y):
+            w_field[i, j] = (
+                -0.5 * kappa_x * x_i**2
+                - 0.5 * kappa_y * y_j**2
+                - 0.5 * kappa_xy * x_i * y_j
+            )
+
+    plt.figure()
+    plt.contourf(x, y, w_field.T, 40)
+    plt.colorbar()
+    plt.xlabel("x (m)")
+    plt.ylabel("y (m)")
+    plt.title("Out-of-plane displacement, w(x, y)")
+    plt.tight_layout()
+    plt.show()
+
+    pd.DataFrame(w_field.T).to_excel(
+        "w_displacement_data.xlsx",
+        index=False,
+        header=False,
+    )
+
+    # -------------------------------------------------------------------------
+    # Displacement field after stress relaxation
+    # -------------------------------------------------------------------------
+    kappa_x_relaxed = deformation_relaxed[3]
+    kappa_y_relaxed = deformation_relaxed[4]
+    kappa_xy_relaxed = deformation_relaxed[5]
+    w_field_relaxed = np.zeros((num_x, num_y))
+
+    for i, x_i in enumerate(x):
+        for j, y_j in enumerate(y):
+            w_field_relaxed[i, j] = (
+                -0.5 * kappa_x_relaxed * x_i**2
+                - 0.5 * kappa_y_relaxed * y_j**2
+                - 0.5 * kappa_xy_relaxed * x_i * y_j
+            )
+
+    plt.figure()
+    plt.contourf(x, y, w_field_relaxed.T, 40)
+    plt.colorbar()
+    plt.xlabel("x (m)")
+    plt.ylabel("y (m)")
+    plt.title("Out-of-plane displacement after stress relaxation, w(x, y)")
+    plt.tight_layout()
+    plt.show()
+
+    pd.DataFrame(w_field_relaxed.T).to_excel(
+        "w_displacement_data_relaxed.xlsx",
+        index=False,
+        header=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
